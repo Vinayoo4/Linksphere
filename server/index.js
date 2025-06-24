@@ -7,6 +7,14 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
 import { v4 as uuidv4 } from 'uuid';
+import { connectDB } from './db.js';
+import Link from './models/Link.js';
+import Pdf from './models/Pdf.js';
+import News from './models/News.js';
+import Alert from './models/Alert.js';
+import Group from './models/Group.js';
+import Settings from './models/Settings.js';
+import Analytics from './models/Analytics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,45 +69,8 @@ const upload = multer({
   }
 });
 
-// In-memory data store (in production, use a real database)
-let appData = {
-  links: [],
-  pdfs: [],
-  news: [],
-  alerts: [],
-  groups: [],
-  analytics: {
-    totalViews: 0,
-    totalUsers: 0,
-    engagement: 0,
-    contentGrowth: [],
-    userActivity: []
-  },
-  settings: {
-    siteName: 'LinkSphere',
-    adminPin: '1234',
-    theme: 'light',
-    notifications: true
-  }
-};
-
-// Load data from file if exists
-const dataFile = path.join(__dirname, 'data.json');
-try {
-  const data = await fs.readFile(dataFile, 'utf8');
-  appData = { ...appData, ...JSON.parse(data) };
-} catch (error) {
-  console.log('No existing data file found, starting fresh');
-}
-
-// Save data to file
-const saveData = async () => {
-  try {
-    await fs.writeFile(dataFile, JSON.stringify(appData, null, 2));
-  } catch (error) {
-    console.error('Error saving data:', error);
-  }
-};
+// Connect to MongoDB
+await connectDB();
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
@@ -164,326 +135,429 @@ io.on('connection', (socket) => {
 // REST API Routes
 
 // Get all data
-app.get('/api/data', (req, res) => {
-  res.json(appData);
-});
-
-// Links endpoints
-app.get('/api/links', (req, res) => {
-  res.json(appData.links);
-});
-
-app.post('/api/links', (req, res) => {
-  const newLink = { ...req.body, id: uuidv4(), createdAt: new Date().toISOString() };
-  appData.links.push(newLink);
-  io.emit('content-updated', { type: 'links', action: 'add', content: newLink });
-  saveData();
-  res.json(newLink);
-});
-
-app.put('/api/links/:id', (req, res) => {
-  const index = appData.links.findIndex(link => link.id === req.params.id);
-  if (index !== -1) {
-    appData.links[index] = { ...appData.links[index], ...req.body, updatedAt: new Date().toISOString() };
-    io.emit('content-updated', { type: 'links', action: 'update', content: appData.links[index] });
-    saveData();
-    res.json(appData.links[index]);
-  } else {
-    res.status(404).json({ error: 'Link not found' });
+app.get('/api/data', async (req, res) => {
+  try {
+    const [links, pdfs, news, alerts, groups, analytics, settings] = await Promise.all([
+      Link.find().sort({ createdAt: -1 }),
+      Pdf.find().sort({ createdAt: -1 }),
+      News.find().sort({ createdAt: -1 }),
+      Alert.find().sort({ createdAt: -1 }),
+      Group.find().sort({ createdAt: -1 }),
+      Analytics.findOne(),
+      Settings.findOne()
+    ]);
+    res.json({
+      links,
+      pdfs,
+      news,
+      alerts,
+      groups,
+      analytics,
+      settings
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch data', details: error.message });
   }
 });
 
-app.delete('/api/links/:id', (req, res) => {
-  const link = appData.links.find(link => link.id === req.params.id);
-  if (link) {
-    appData.links = appData.links.filter(link => link.id !== req.params.id);
-    io.emit('content-updated', { type: 'links', action: 'delete', content: { id: req.params.id } });
-    saveData();
+// Links endpoints
+app.get('/api/links', async (req, res) => {
+  try {
+    const links = await Link.find().sort({ createdAt: -1 });
+    res.json(links);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch links', details: error.message });
+  }
+});
+
+app.post('/api/links', async (req, res) => {
+  try {
+    const { title, url, description, icon } = req.body;
+    if (!title || !url) {
+      return res.status(400).json({ error: 'Title and URL are required' });
+    }
+    const newLink = await Link.create({ title, url, description, icon });
+    io.emit('content-updated', { type: 'links', action: 'add', content: newLink });
+    res.status(201).json(newLink);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create link', details: error.message });
+  }
+});
+
+app.put('/api/links/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = { ...req.body, updatedAt: new Date() };
+    const updatedLink = await Link.findByIdAndUpdate(id, update, { new: true, runValidators: true });
+    if (!updatedLink) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+    io.emit('content-updated', { type: 'links', action: 'update', content: updatedLink });
+    res.json(updatedLink);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update link', details: error.message });
+  }
+});
+
+app.delete('/api/links/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deletedLink = await Link.findByIdAndDelete(id);
+    if (!deletedLink) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+    io.emit('content-updated', { type: 'links', action: 'delete', content: { id } });
     res.json({ message: 'Link deleted' });
-  } else {
-    res.status(404).json({ error: 'Link not found' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete link', details: error.message });
   }
 });
 
 // PDFs endpoints
-app.get('/api/pdfs', (req, res) => {
-  res.json(appData.pdfs);
+app.get('/api/pdfs', async (req, res) => {
+  try {
+    const pdfs = await Pdf.find().sort({ createdAt: -1 });
+    res.json(pdfs);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch PDFs', details: error.message });
+  }
 });
 
-app.post('/api/pdfs', upload.single('pdf'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
+app.post('/api/pdfs', upload.single('pdf'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const { title, description } = req.body;
+    const newPdf = await Pdf.create({
+      title: title || req.file.originalname,
+      description,
+      url: `/uploads/${req.file.filename}`,
+      size: `${(req.file.size / 1024 / 1024).toFixed(2)} MB`,
+      filename: req.file.filename
+    });
+    io.emit('content-updated', { type: 'pdfs', action: 'add', content: newPdf });
+    res.status(201).json(newPdf);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to upload PDF', details: error.message });
   }
-  
-  const newPdf = {
-    id: uuidv4(),
-    title: req.body.title || req.file.originalname,
-    description: req.body.description || '',
-    url: `/uploads/${req.file.filename}`,
-    size: `${(req.file.size / 1024 / 1024).toFixed(2)} MB`,
-    filename: req.file.filename,
-    createdAt: new Date().toISOString()
-  };
-  
-  appData.pdfs.push(newPdf);
-  io.emit('content-updated', { type: 'pdfs', action: 'add', content: newPdf });
-  saveData();
-  res.json(newPdf);
 });
 
 app.delete('/api/pdfs/:id', async (req, res) => {
-  const pdf = appData.pdfs.find(pdf => pdf.id === req.params.id);
-  if (pdf) {
+  try {
+    const pdf = await Pdf.findById(req.params.id);
+    if (!pdf) {
+      return res.status(404).json({ error: 'PDF not found' });
+    }
     // Delete file from filesystem
     try {
       await fs.unlink(path.join(__dirname, 'uploads', pdf.filename));
     } catch (error) {
       console.error('Error deleting file:', error);
     }
-    
-    appData.pdfs = appData.pdfs.filter(pdf => pdf.id !== req.params.id);
+    await Pdf.findByIdAndDelete(req.params.id);
     io.emit('content-updated', { type: 'pdfs', action: 'delete', content: { id: req.params.id } });
-    saveData();
     res.json({ message: 'PDF deleted' });
-  } else {
-    res.status(404).json({ error: 'PDF not found' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete PDF', details: error.message });
   }
 });
 
 // News endpoints
-app.get('/api/news', (req, res) => {
-  res.json(appData.news);
-});
-
-app.post('/api/news', upload.single('image'), (req, res) => {
-  const newNews = {
-    id: uuidv4(),
-    title: req.body.title,
-    excerpt: req.body.excerpt,
-    content: req.body.content,
-    url: req.body.url,
-    image: req.file ? `/uploads/${req.file.filename}` : req.body.image,
-    date: new Date().toLocaleDateString(),
-    createdAt: new Date().toISOString()
-  };
-  
-  appData.news.push(newNews);
-  io.emit('content-updated', { type: 'news', action: 'add', content: newNews });
-  saveData();
-  res.json(newNews);
-});
-
-app.put('/api/news/:id', upload.single('image'), (req, res) => {
-  const index = appData.news.findIndex(item => item.id === req.params.id);
-  if (index !== -1) {
-    const updatedNews = {
-      ...appData.news[index],
-      ...req.body,
-      updatedAt: new Date().toISOString()
-    };
-    
-    if (req.file) {
-      updatedNews.image = `/uploads/${req.file.filename}`;
-    }
-    
-    appData.news[index] = updatedNews;
-    io.emit('content-updated', { type: 'news', action: 'update', content: updatedNews });
-    saveData();
-    res.json(updatedNews);
-  } else {
-    res.status(404).json({ error: 'News not found' });
+app.get('/api/news', async (req, res) => {
+  try {
+    const news = await News.find().sort({ createdAt: -1 });
+    res.json(news);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch news', details: error.message });
   }
 });
 
-app.delete('/api/news/:id', (req, res) => {
-  const news = appData.news.find(item => item.id === req.params.id);
-  if (news) {
-    appData.news = appData.news.filter(item => item.id !== req.params.id);
-    io.emit('content-updated', { type: 'news', action: 'delete', content: { id: req.params.id } });
-    saveData();
+app.post('/api/news', upload.single('image'), async (req, res) => {
+  try {
+    const { title, excerpt, content, url } = req.body;
+    if (!title || !excerpt) {
+      return res.status(400).json({ error: 'Title and excerpt are required' });
+    }
+    const newsData = {
+      title,
+      excerpt,
+      content,
+      url,
+      image: req.file ? `/uploads/${req.file.filename}` : req.body.image,
+      date: new Date().toLocaleDateString()
+    };
+    const newNews = await News.create(newsData);
+    io.emit('content-updated', { type: 'news', action: 'add', content: newNews });
+    res.status(201).json(newNews);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create news', details: error.message });
+  }
+});
+
+app.put('/api/news/:id', upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = {
+      ...req.body,
+      updatedAt: new Date()
+    };
+    if (req.file) {
+      update.image = `/uploads/${req.file.filename}`;
+    }
+    const updatedNews = await News.findByIdAndUpdate(id, update, { new: true, runValidators: true });
+    if (!updatedNews) {
+      return res.status(404).json({ error: 'News not found' });
+    }
+    io.emit('content-updated', { type: 'news', action: 'update', content: updatedNews });
+    res.json(updatedNews);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update news', details: error.message });
+  }
+});
+
+app.delete('/api/news/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deletedNews = await News.findByIdAndDelete(id);
+    if (!deletedNews) {
+      return res.status(404).json({ error: 'News not found' });
+    }
+    io.emit('content-updated', { type: 'news', action: 'delete', content: { id } });
     res.json({ message: 'News deleted' });
-  } else {
-    res.status(404).json({ error: 'News not found' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete news', details: error.message });
   }
 });
 
 // Alerts endpoints
-app.get('/api/alerts', (req, res) => {
-  res.json(appData.alerts);
-});
-
-app.post('/api/alerts', (req, res) => {
-  const newAlert = {
-    id: uuidv4(),
-    title: req.body.title,
-    message: req.body.message,
-    type: req.body.type || 'info',
-    priority: req.body.priority || 'medium',
-    expiresAt: req.body.expiresAt,
-    date: new Date().toLocaleDateString(),
-    createdAt: new Date().toISOString()
-  };
-  
-  appData.alerts.push(newAlert);
-  io.emit('content-updated', { type: 'alerts', action: 'add', content: newAlert });
-  saveData();
-  res.json(newAlert);
-});
-
-app.put('/api/alerts/:id', (req, res) => {
-  const index = appData.alerts.findIndex(alert => alert.id === req.params.id);
-  if (index !== -1) {
-    appData.alerts[index] = { ...appData.alerts[index], ...req.body, updatedAt: new Date().toISOString() };
-    io.emit('content-updated', { type: 'alerts', action: 'update', content: appData.alerts[index] });
-    saveData();
-    res.json(appData.alerts[index]);
-  } else {
-    res.status(404).json({ error: 'Alert not found' });
+app.get('/api/alerts', async (req, res) => {
+  try {
+    const alerts = await Alert.find().sort({ createdAt: -1 });
+    res.json(alerts);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch alerts', details: error.message });
   }
 });
 
-app.delete('/api/alerts/:id', (req, res) => {
-  const alert = appData.alerts.find(alert => alert.id === req.params.id);
-  if (alert) {
-    appData.alerts = appData.alerts.filter(alert => alert.id !== req.params.id);
-    io.emit('content-updated', { type: 'alerts', action: 'delete', content: { id: req.params.id } });
-    saveData();
+app.post('/api/alerts', async (req, res) => {
+  try {
+    const { title, message, type, priority, expiresAt } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ error: 'Title and message are required' });
+    }
+    const newAlert = await Alert.create({
+      title,
+      message,
+      type: type || 'info',
+      priority: priority || 'medium',
+      expiresAt,
+      date: new Date().toLocaleDateString()
+    });
+    io.emit('content-updated', { type: 'alerts', action: 'add', content: newAlert });
+    res.status(201).json(newAlert);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create alert', details: error.message });
+  }
+});
+
+app.put('/api/alerts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = { ...req.body, updatedAt: new Date() };
+    const updatedAlert = await Alert.findByIdAndUpdate(id, update, { new: true, runValidators: true });
+    if (!updatedAlert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    io.emit('content-updated', { type: 'alerts', action: 'update', content: updatedAlert });
+    res.json(updatedAlert);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update alert', details: error.message });
+  }
+});
+
+app.delete('/api/alerts/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deletedAlert = await Alert.findByIdAndDelete(id);
+    if (!deletedAlert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+    io.emit('content-updated', { type: 'alerts', action: 'delete', content: { id } });
     res.json({ message: 'Alert deleted' });
-  } else {
-    res.status(404).json({ error: 'Alert not found' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete alert', details: error.message });
   }
 });
 
 // Groups endpoints
-app.get('/api/groups', (req, res) => {
-  res.json(appData.groups);
-});
-
-app.post('/api/groups', (req, res) => {
-  const newGroup = {
-    id: uuidv4(),
-    name: req.body.name,
-    description: req.body.description,
-    category: req.body.category,
-    resources: req.body.resources || [],
-    joinLink: req.body.joinLink,
-    memberCount: req.body.memberCount || 0,
-    isPrivate: req.body.isPrivate || false,
-    createdAt: new Date().toISOString()
-  };
-  
-  appData.groups.push(newGroup);
-  io.emit('content-updated', { type: 'groups', action: 'add', content: newGroup });
-  saveData();
-  res.json(newGroup);
-});
-
-app.put('/api/groups/:id', (req, res) => {
-  const index = appData.groups.findIndex(group => group.id === req.params.id);
-  if (index !== -1) {
-    appData.groups[index] = { ...appData.groups[index], ...req.body, updatedAt: new Date().toISOString() };
-    io.emit('content-updated', { type: 'groups', action: 'update', content: appData.groups[index] });
-    saveData();
-    res.json(appData.groups[index]);
-  } else {
-    res.status(404).json({ error: 'Group not found' });
+app.get('/api/groups', async (req, res) => {
+  try {
+    const groups = await Group.find().sort({ createdAt: -1 });
+    res.json(groups);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch groups', details: error.message });
   }
 });
 
-app.delete('/api/groups/:id', (req, res) => {
-  const group = appData.groups.find(group => group.id === req.params.id);
-  if (group) {
-    appData.groups = appData.groups.filter(group => group.id !== req.params.id);
-    io.emit('content-updated', { type: 'groups', action: 'delete', content: { id: req.params.id } });
-    saveData();
+app.post('/api/groups', async (req, res) => {
+  try {
+    const { name, description, category, resources, joinLink, memberCount, isPrivate } = req.body;
+    if (!name) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    const newGroup = await Group.create({
+      name,
+      description,
+      category,
+      resources,
+      joinLink,
+      memberCount,
+      isPrivate
+    });
+    io.emit('content-updated', { type: 'groups', action: 'add', content: newGroup });
+    res.status(201).json(newGroup);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create group', details: error.message });
+  }
+});
+
+app.put('/api/groups/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = { ...req.body, updatedAt: new Date() };
+    const updatedGroup = await Group.findByIdAndUpdate(id, update, { new: true, runValidators: true });
+    if (!updatedGroup) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    io.emit('content-updated', { type: 'groups', action: 'update', content: updatedGroup });
+    res.json(updatedGroup);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update group', details: error.message });
+  }
+});
+
+app.delete('/api/groups/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deletedGroup = await Group.findByIdAndDelete(id);
+    if (!deletedGroup) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    io.emit('content-updated', { type: 'groups', action: 'delete', content: { id } });
     res.json({ message: 'Group deleted' });
-  } else {
-    res.status(404).json({ error: 'Group not found' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete group', details: error.message });
+  }
+});
+
+// Settings endpoints
+app.get('/api/settings', async (req, res) => {
+  try {
+    let settings = await Settings.findOne();
+    if (!settings) {
+      settings = await Settings.create({ adminPin: '1234' });
+    }
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch settings', details: error.message });
+  }
+});
+
+app.put('/api/settings', async (req, res) => {
+  try {
+    let settings = await Settings.findOne();
+    if (!settings) {
+      settings = await Settings.create({ adminPin: '1234' });
+    }
+    Object.assign(settings, req.body);
+    await settings.save();
+    io.emit('settings-updated', settings);
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update settings', details: error.message });
   }
 });
 
 // Analytics endpoints
-app.get('/api/analytics', (req, res) => {
-  // Generate real-time analytics
-  const analytics = {
-    ...appData.analytics,
-    totalContent: appData.links.length + appData.pdfs.length + appData.news.length + appData.alerts.length + appData.groups.length,
-    totalViews: Math.floor(Math.random() * 10000) + 5000,
-    activeUsers: Math.floor(Math.random() * 500) + 100,
-    engagement: Math.random() * 0.8 + 0.2,
-    contentGrowth: Array.from({ length: 12 }, (_, i) => ({
-      week: i + 1,
-      content: Math.floor(Math.random() * 50) + 10
-    })),
-    userActivity: Array.from({ length: 7 }, (_, i) => ({
-      day: new Date(Date.now() - i * 24 * 60 * 60 * 1000).toLocaleDateString(),
-      active: Math.floor(Math.random() * 1000) + 100
-    }))
-  };
-  
-  res.json(analytics);
-});
-
-// Settings endpoints
-app.get('/api/settings', (req, res) => {
-  res.json(appData.settings);
-});
-
-app.put('/api/settings', (req, res) => {
-  appData.settings = { ...appData.settings, ...req.body };
-  io.emit('settings-updated', appData.settings);
-  saveData();
-  res.json(appData.settings);
+app.get('/api/analytics', async (req, res) => {
+  try {
+    let analytics = await Analytics.findOne();
+    if (!analytics) {
+      analytics = await Analytics.create({});
+    }
+    // Optionally, add real-time stats here
+    res.json(analytics);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch analytics', details: error.message });
+  }
 });
 
 // Search endpoint
-app.get('/api/search', (req, res) => {
-  const query = req.query.q?.toLowerCase() || '';
-  const type = req.query.type || 'all';
-  
-  let results = [];
-  
-  if (type === 'all' || type === 'links') {
-    const linkResults = appData.links.filter(item => 
-      item.title.toLowerCase().includes(query) || 
-      item.description.toLowerCase().includes(query)
-    ).map(item => ({ ...item, type: 'link' }));
-    results.push(...linkResults);
+app.get('/api/search', async (req, res) => {
+  try {
+    const query = req.query.q?.toLowerCase() || '';
+    const type = req.query.type || 'all';
+    let results = [];
+    if (!query) {
+      return res.json([]);
+    }
+    if (type === 'all' || type === 'links') {
+      const linkResults = await Link.find({
+        $or: [
+          { title: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } }
+        ]
+      });
+      results.push(...linkResults.map(item => ({ ...item.toObject(), type: 'link' })));
+    }
+    if (type === 'all' || type === 'news') {
+      const newsResults = await News.find({
+        $or: [
+          { title: { $regex: query, $options: 'i' } },
+          { excerpt: { $regex: query, $options: 'i' } }
+        ]
+      });
+      results.push(...newsResults.map(item => ({ ...item.toObject(), type: 'news' })));
+    }
+    if (type === 'all' || type === 'pdfs') {
+      const pdfResults = await Pdf.find({
+        title: { $regex: query, $options: 'i' }
+      });
+      results.push(...pdfResults.map(item => ({ ...item.toObject(), type: 'pdf' })));
+    }
+    if (type === 'all' || type === 'alerts') {
+      const alertResults = await Alert.find({
+        $or: [
+          { title: { $regex: query, $options: 'i' } },
+          { message: { $regex: query, $options: 'i' } }
+        ]
+      });
+      results.push(...alertResults.map(item => ({ ...item.toObject(), type: 'alert' })));
+    }
+    if (type === 'all' || type === 'groups') {
+      const groupResults = await Group.find({
+        $or: [
+          { name: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } }
+        ]
+      });
+      results.push(...groupResults.map(item => ({ ...item.toObject(), type: 'group' })));
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to search', details: error.message });
   }
-  
-  if (type === 'all' || type === 'news') {
-    const newsResults = appData.news.filter(item => 
-      item.title.toLowerCase().includes(query) || 
-      item.excerpt.toLowerCase().includes(query)
-    ).map(item => ({ ...item, type: 'news' }));
-    results.push(...newsResults);
-  }
-  
-  if (type === 'all' || type === 'pdfs') {
-    const pdfResults = appData.pdfs.filter(item => 
-      item.title.toLowerCase().includes(query)
-    ).map(item => ({ ...item, type: 'pdf' }));
-    results.push(...pdfResults);
-  }
-  
-  if (type === 'all' || type === 'alerts') {
-    const alertResults = appData.alerts.filter(item => 
-      item.title.toLowerCase().includes(query) || 
-      item.message.toLowerCase().includes(query)
-    ).map(item => ({ ...item, type: 'alert' }));
-    results.push(...alertResults);
-  }
-  
-  if (type === 'all' || type === 'groups') {
-    const groupResults = appData.groups.filter(item => 
-      item.name.toLowerCase().includes(query) || 
-      item.description.toLowerCase().includes(query)
-    ).map(item => ({ ...item, type: 'group' }));
-    results.push(...groupResults);
-  }
-  
-  res.json(results);
 });
+
+// Serve frontend static files in production
+if (process.env.NODE_ENV === 'production') {
+  const clientBuildPath = path.join(__dirname, '../dist');
+  app.use(express.static(clientBuildPath));
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(clientBuildPath, 'index.html'));
+  });
+}
 
 // Error handling middleware
 app.use((error, req, res, next) => {

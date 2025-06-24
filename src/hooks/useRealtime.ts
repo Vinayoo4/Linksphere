@@ -3,7 +3,7 @@ import { io, Socket } from 'socket.io-client';
 import { useLinks } from './useLinks';
 import toast from 'react-hot-toast';
 
-const SOCKET_URL = 'http://localhost:3001';
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || window.location.origin;
 
 interface ContentUpdate {
   type: 'links' | 'pdfs' | 'news' | 'alerts' | 'groups';
